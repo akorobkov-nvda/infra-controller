@@ -205,7 +205,7 @@ impl Principal {
     }
 }
 
-// try_external_cert will return a Pricipal::ExternalUser if this looks like some external cert
+// try_external_cert will return a Principal::ExternalUser if this looks like some external cert
 fn try_external_cert<AZ: Authorization>(
     der_certificate: &[u8],
     auth_context: &CertDescriptionMiddleware<AZ>,
@@ -484,10 +484,16 @@ where
                 }
             });
             auth_context.principals.extend(peer_cert_principals);
-            // Regardless of whether we were able to get a specific Principal
-            // flavor out of the certificate, having a trusted certificate
-            // presented by the client is worth recording on its own.
-            if !peer_certs.is_empty() {
+            // Add TrustedCertificate only if we didn't identify a more specific
+            // ExternalUser principal with a valid group. This allows Casbin policies
+            // to use `trusted-certificate` as a fallback for services without
+            // specific role assignments, while still enforcing group-based RBAC
+            // for ExternalUser principals.
+            let has_external_user_with_group = auth_context
+                .principals
+                .iter()
+                .any(|p| matches!(p, Principal::ExternalUser(info) if !info.group.is_empty()));
+            if !peer_certs.is_empty() && !has_external_user_with_group {
                 auth_context.principals.push(Principal::TrustedCertificate);
             }
         } else {
@@ -496,5 +502,97 @@ where
 
         extensions.insert(auth_context);
         self.inner.call(request)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_external_user_with_group_excludes_trusted_certificate() {
+        // When an ExternalUser principal with a non-empty group is present,
+        // TrustedCertificate should NOT be added. This ensures group-based
+        // Casbin policies are enforced for external users.
+        let principals = vec![Principal::ExternalUser(ExternalUserInfo {
+            org: None,
+            group: "approle-ro".to_string(),
+            user: Some("test-user".to_string()),
+        })];
+
+        let has_external_user_with_group = principals
+            .iter()
+            .any(|p| matches!(p, Principal::ExternalUser(info) if !info.group.is_empty()));
+
+        assert!(
+            has_external_user_with_group,
+            "Should detect ExternalUser with non-empty group"
+        );
+    }
+
+    #[test]
+    fn test_external_user_with_empty_group_allows_trusted_certificate() {
+        // When an ExternalUser principal has an empty group,
+        // TrustedCertificate SHOULD be added as a fallback.
+        let principals = vec![Principal::ExternalUser(ExternalUserInfo {
+            org: None,
+            group: "".to_string(),
+            user: Some("test-user".to_string()),
+        })];
+
+        let has_external_user_with_group = principals
+            .iter()
+            .any(|p| matches!(p, Principal::ExternalUser(info) if !info.group.is_empty()));
+
+        assert!(
+            !has_external_user_with_group,
+            "Should NOT detect ExternalUser with empty group"
+        );
+    }
+
+    #[test]
+    fn test_spiffe_principal_allows_trusted_certificate() {
+        // SPIFFE principals (services and machines) should still get
+        // TrustedCertificate added, so `p, trusted-certificate, forge/*`
+        // continues to work for internal services.
+        let principals = vec![Principal::SpiffeServiceIdentifier(
+            "carbide-dns".to_string(),
+        )];
+
+        let has_external_user_with_group = principals
+            .iter()
+            .any(|p| matches!(p, Principal::ExternalUser(info) if !info.group.is_empty()));
+
+        assert!(
+            !has_external_user_with_group,
+            "SPIFFE principals should not block TrustedCertificate"
+        );
+    }
+
+    #[test]
+    fn test_principal_as_identifier_external_user() {
+        let principal = Principal::ExternalUser(ExternalUserInfo {
+            org: None,
+            group: "approle-ro".to_string(),
+            user: Some("test-user".to_string()),
+        });
+
+        assert_eq!(
+            principal.as_identifier(),
+            "external-role/approle-ro",
+            "ExternalUser should map to external-role/{{group}} for Casbin"
+        );
+    }
+
+    #[test]
+    fn test_principal_as_identifier_trusted_certificate() {
+        let principal = Principal::TrustedCertificate;
+        assert_eq!(principal.as_identifier(), "trusted-certificate");
+    }
+
+    #[test]
+    fn test_principal_as_identifier_spiffe_service() {
+        let principal = Principal::SpiffeServiceIdentifier("carbide-dns".to_string());
+        assert_eq!(principal.as_identifier(), "spiffe-service-id/carbide-dns");
     }
 }
