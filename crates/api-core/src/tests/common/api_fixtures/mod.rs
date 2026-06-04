@@ -280,6 +280,8 @@ pub struct TestEnv {
     pub attestation_enabled: bool,
     pub site_explorer: SiteExplorer,
     pub nmxc_sim: Arc<dyn NmxcPool>,
+    /// True when the test env uses [`NmxcSimClient::simulator_for_nvlink_config`] (gRPC proxy to a local simulator).
+    pub nmxc_grpc_simulator: bool,
     pub endpoint_explorer: MockEndpointExplorer,
     pub admin_segments: Vec<NetworkSegmentId>,
     pub underlay_segment: Option<NetworkSegmentId>,
@@ -1114,7 +1116,8 @@ pub async fn create_test_env_with_overrides(
         .cloned()
         .unwrap_or_default();
 
-    let nmxc_sim: Arc<dyn NmxcPool> = if overrides.nmxc_simulator == Some(true) {
+    let nmxc_grpc_simulator = overrides.nmxc_simulator == Some(true);
+    let nmxc_sim: Arc<dyn NmxcPool> = if nmxc_grpc_simulator {
         Arc::new(NmxcSimClient::simulator_for_nvlink_config(
             &nvlink_for_nmxc_sim,
         ))
@@ -1548,6 +1551,7 @@ pub async fn create_test_env_with_overrides(
         test_meter,
         site_explorer,
         nmxc_sim,
+        nmxc_grpc_simulator,
         endpoint_explorer: fake_endpoint_explorer,
         admin_segments,
         underlay_segment,
@@ -2223,21 +2227,26 @@ fn hardware_info_from_hardware_info_template(
     serde_json::from_slice::<HardwareInfo>(json_bytes).ok()
 }
 
-/// Inserts `nvlink_nmxc_endpoints` with a random `http://<ipv4>:<port>` endpoint when the template's
-/// `dmi_data.product_name` contains `"GB200"` and a non-empty `gpus[].platform_info.chassis_serial`
-/// exists. Skips if the row already exists or on DB errors.
+/// Inserts `nvlink_nmxc_endpoints` with the NMX-C gRPC simulator default URL when the test env
+/// uses the gRPC simulator, otherwise a random `http://<ipv4>:<port>` endpoint, when the
+/// template's `dmi_data.product_name` contains `"GB200"` and a non-empty
+/// `gpus[].platform_info.chassis_serial` exists. Skips if the row already exists or on DB errors.
 pub async fn insert_nvlink_nmxc_endpoint_from_managed_host(
     env: &TestEnv,
     hardware_info_template: &managed_host::HardwareInfoTemplate,
 ) {
-    let endpoint = format!(
-        "http://{}.{}.{}.{}:{}",
-        rand::random::<u8>(),
-        rand::random::<u8>(),
-        rand::random::<u8>(),
-        rand::random::<u8>(),
-        rand::random::<u16>() % 40_000 + 10_000,
-    );
+    let endpoint = if env.nmxc_grpc_simulator {
+        NmxcSimClient::SIMULATOR_URL.to_string()
+    } else {
+        format!(
+            "http://{}.{}.{}.{}:{}",
+            rand::random::<u8>(),
+            rand::random::<u8>(),
+            rand::random::<u8>(),
+            rand::random::<u8>(),
+            rand::random::<u16>() % 40_000 + 10_000,
+        )
+    };
     let Some(hi) = hardware_info_from_hardware_info_template(hardware_info_template) else {
         return;
     };
@@ -2285,6 +2294,27 @@ pub async fn insert_nvlink_nmxc_endpoint_from_managed_host(
         return;
     }
     txn.commit().await.ok();
+}
+
+pub async fn set_nvlink_nmxc_endpoint(env: &TestEnv, chassis_serial: &str, endpoint: &str) {
+    let mut txn = db::Transaction::begin(&env.pool)
+        .await
+        .expect("begin txn for nvlink_nmxc_endpoint");
+    match db::nvlink_nmxc_endpoints::find_by_chassis_serial(&mut txn, chassis_serial).await {
+        Ok(None) => {
+            db::nvlink_nmxc_endpoints::create(&mut txn, chassis_serial, endpoint)
+                .await
+                .expect("create nvlink_nmxc_endpoint");
+        }
+        Ok(Some(_)) => {
+            db::nvlink_nmxc_endpoints::update(&mut txn, chassis_serial, endpoint)
+                .await
+                .expect("update nvlink_nmxc_endpoint")
+                .expect("nvlink_nmxc_endpoint row missing after find");
+        }
+        Err(e) => panic!("find nvlink_nmxc_endpoint: {e}"),
+    }
+    txn.commit().await.expect("commit nvlink_nmxc_endpoint");
 }
 
 pub async fn update_time_params(
