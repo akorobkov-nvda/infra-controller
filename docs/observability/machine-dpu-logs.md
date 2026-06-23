@@ -172,10 +172,25 @@ processors:
       - key: loki.format
         value: raw
         action: insert
+  batch: {}
+  memory_limiter:
+    check_interval: 5s
+    limit_mib: 4096
+    spike_limit_mib: 1024
 
 exporters:
   loki:
     endpoint: "http://loki.loki.svc.cluster.local:3100/loki/api/v1/push"
+    headers:
+      "X-Scope-OrgID": nico
+
+service:
+  extensions: [file_storage]
+  pipelines:
+    logs:
+      receivers: [filelog]
+      processors: [attributes, batch]
+      exporters: [loki]
 ```
 
 **Alternative: stdout to DaemonSet collector:**
@@ -206,6 +221,11 @@ configFiles:
           - key: component
             value: nico-ssh-console-rs
             action: upsert
+      batch: {}
+      memory_limiter:
+        check_interval: 5s
+        limit_mib: 4096
+        spike_limit_mib: 1024
     exporters:
       debug:
         verbosity: basic    # Writes to stdout
@@ -214,7 +234,7 @@ configFiles:
       pipelines:
         logs:
           receivers: [filelog]
-          processors: [attributes]
+          processors: [memory_limiter, attributes, batch]
           exporters: [debug]
 ```
 
@@ -307,9 +327,9 @@ exporters:
   otlp/site:
     endpoint: site-otel-receiver.nico:443
     tls:
-      ca_file: /opt/nico/nico_root.pem
-      cert_file: /opt/nico/machine_cert.pem
-      key_file: /opt/nico/machine_cert.key
+      ca_file: /opt/forge/forge_root.pem
+      cert_file: /opt/forge/machine_cert.pem
+      key_file: /opt/forge/machine_cert.key
       reload_interval: 1h
     retry_on_failure:
       enabled: true
@@ -439,7 +459,7 @@ systemctl status otelcol-contrib
 journalctl -u otelcol-contrib -f
 
 # Verify certificate files exist
-ls -la /opt/nico/machine_cert.pem /opt/nico/machine_cert.key
+ls -la /opt/forge/machine_cert.pem /opt/forge/machine_cert.key
 ```
 
 **Verify site collector is receiving:**
