@@ -86,9 +86,8 @@ devspace deploy
 DevSpace will:
 
 - build the local runtime images from [`Dockerfile.api`](Dockerfile.api), [`Dockerfile.bmc-proxy`](Dockerfile.bmc-proxy), and [`Dockerfile.machine-a-tron`](Dockerfile.machine-a-tron)
-- deploy the Helm chart in [`helm/`](../../../helm)
-- apply the local-only `machine-a-tron` Kubernetes objects from [`machine-a-tron.yaml`](machine-a-tron.yaml) with `kubectl`
-- inject the built image names and DevSpace-generated tags into both deployments at runtime
+- deploy the Helm chart in [`helm/`](../../../helm) (including `nico-machine-a-tron`)
+- inject the built image names and DevSpace-generated tags into all deployments at runtime
 
 The image builds are configured in [`devspace.yaml`](../../../devspace.yaml). The Dockerfiles are multi-stage builds: the builder stage compiles the Rust binary inside Docker from the local `build-container-localdev` image, and the runtime stage copies only the finished binary and required runtime assets. DevSpace first checks whether `build-container-localdev` already exists locally and reuses it if present; otherwise it builds it from [`dev/docker/Dockerfile.build-container-x86_64`](../../../dev/docker/Dockerfile.build-container-x86_64). BuildKit cache mounts are used for Cargo registry, Cargo git checkouts, and Cargo target output so rebuilds stay fast without copying host build artifacts into the image.
 
@@ -96,7 +95,7 @@ The DevSpace images also use Dockerfile-specific ignore files: [`Dockerfile.api.
 
 DevSpace watches the Rust workspace, toolchain metadata, and the runtime Dockerfiles to decide when images need rebuilding.
 
-The production Helm chart is still only responsible for the product services. `machine-a-tron` is deployed separately as plain local-only Kubernetes objects in [`machine-a-tron.yaml`](machine-a-tron.yaml), with DevSpace wiring in the local image tag and certificate issuer from [`devspace.yaml`](../../../devspace.yaml). The local API and BMC proxy configs in [`values.base.yaml`](values.base.yaml) point BMC traffic at `machine-a-tron-bmc-mock.nico-system.svc.cluster.local:1266`.
+The `nico-machine-a-tron` Helm subchart configuration is in [`values.base.yaml`](values.base.yaml). The local API and BMC proxy configs also point BMC traffic at `nico-machine-a-tron-bmc-mock.nico-system.svc.cluster.local:1266`.
 
 Common usage:
 
@@ -117,7 +116,11 @@ docker build -t "nico-bmc-proxy:<devspace-generated-tag>" -f dev/deployment/devs
 docker build -t "machine-a-tron:<devspace-generated-tag>" -f dev/deployment/devspace/Dockerfile.machine-a-tron .
 ```
 
-DevSpace then deploys the Helm chart with the built `nico-api` image wired into `global.image.repository` and `global.image.tag`, the built `nico-bmc-proxy` image wired into the `nico-bmc-proxy` chart values, and applies the local-only `machine-a-tron` manifest with its image wired into the `Deployment` spec.
+DevSpace then deploys the Helm chart with:
+- the built `nico-api` image wired into `global.image.repository` and `global.image.tag`
+- the built `nico-bmc-proxy` image wired into the `nico-bmc-proxy` chart values
+- the built `machine-a-tron` image wired into the `nico-machine-a-tron` chart values
+- certificate issuer settings from the DevSpace environment variables
 
 ## Re-initializing infra-controller to a clean slate
 
@@ -129,7 +132,7 @@ You can start over again (purging the resources from k8s) by running:
 devspace purge -n nico-system
 ```
 
-and it will delete the NICo Helm release and machine-a-tron deployments.
+and it will delete the NICo Helm release (including machine-a-tron).
 
 To clear out the nico database to start from scratch again, run the nuke-postgres.sh helper script:
 
