@@ -17,19 +17,20 @@
 
 //! Builds the OTLP span-export layer for service binaries.
 //!
-//! Exports spans only when a collector endpoint is configured. A rejected
-//! endpoint logs a warning and leaves the service running.
+//! Exports spans only when a collector endpoint is set. A bad endpoint logs a
+//! warning and the service keeps running.
 //!
-//! The returned layer carries its own span filter, so the span level changes
-//! without affecting log output. Attach the log `EnvFilter` to each log layer,
-//! not to the registry, because a registry filter also applies to this layer.
+//! The layer carries its own span filter, so changing the span level does not
+//! change log output. Attach the log `EnvFilter` to each log layer rather than
+//! the registry, since a registry filter also applies to this layer.
 //!
 //! ```no_run
+//! use tracing_subscriber::Layer;
 //! use tracing_subscriber::layer::SubscriberExt;
 //! use tracing_subscriber::util::SubscriberInitExt;
-//! use tracing_subscriber::Layer;
 //!
-//! # fn main() -> Result<(), Box<dyn std::error::Error>> {
+//! # #[tokio::main]
+//! # async fn main() -> Result<(), Box<dyn std::error::Error>> {
 //! let log_filter = tracing_subscriber::EnvFilter::builder()
 //!     .with_default_directive(tracing_subscriber::filter::LevelFilter::INFO.into())
 //!     .from_env_lossy();
@@ -45,21 +46,22 @@
 //!
 //! tracing.report();
 //! // ... run the service ...
+//! tracing.shutdown().await;
 //! # Ok(()) }
 //! ```
 //!
 //! # Shutdown
 //!
 //! The exporter sends spans in batches on a timer. Call [`Tracing::shutdown`]
-//! before the process exits to send the current batch.
+//! before the process exits to send the last batch.
 //!
 //! # Sampling
 //!
 //! This module installs no sampler, so `OTEL_TRACES_SAMPLER` and
 //! `OTEL_TRACES_SAMPLER_ARG` take effect. Prefer `parentbased_traceidratio`,
-//! which applies the ratio only where a trace starts. Note that a sampler drops
-//! spans before the collector sees them, so leave it at the default when the
-//! collector selects traces by latency or errors.
+//! which applies the ratio only where a trace starts. A sampler drops spans
+//! before the collector sees them, so keep the default if the collector picks
+//! traces by latency or errors.
 
 use opentelemetry::trace::TracerProvider as _;
 use opentelemetry::{KeyValue, global};
@@ -71,40 +73,40 @@ use tracing_subscriber::Layer;
 use tracing_subscriber::filter::LevelFilter;
 use tracing_subscriber::registry::LookupSpan;
 
-/// Standard OTLP endpoint variables, in precedence order. The trace-only variable
-/// comes first, then the one that also applies to metrics and logs.
-const ENDPOINT_VARS: [&str; 2] = [
-    opentelemetry_otlp::OTEL_EXPORTER_OTLP_TRACES_ENDPOINT,
-    opentelemetry_otlp::OTEL_EXPORTER_OTLP_ENDPOINT,
-];
+/// Standard OTLP endpoint variable for traces only.
+const TRACES_ENDPOINT_VAR: &str = opentelemetry_otlp::OTEL_EXPORTER_OTLP_TRACES_ENDPOINT;
 
-/// Sets the most verbose span level exported, separately from the log level. A
-/// span's level comes from the macro that creates it, such as `info_span!`.
-/// OpenTelemetry defines no equivalent variable, so this module reads it
-/// directly.
+/// Standard OTLP endpoint variable that also applies to metrics and logs.
+const GENERIC_ENDPOINT_VAR: &str = opentelemetry_otlp::OTEL_EXPORTER_OTLP_ENDPOINT;
+
+/// Both endpoint variables, in precedence order.
+const ENDPOINT_VARS: [&str; 2] = [TRACES_ENDPOINT_VAR, GENERIC_ENDPOINT_VAR];
+
+/// Controls span verbosity independently of `RUST_LOG`.
 pub const SPAN_LEVEL_VAR: &str = "NICO_TRACES_SPAN_LEVEL";
 
-/// How a service configures span export.
+/// Collector and filtering settings for span export.
 #[derive(Debug, Clone)]
 pub struct Config {
-    /// Sets `service.name` on the exported spans and names the tracer. Use the
-    /// deployed component name, such as `nico-pxe` rather than `carbide-pxe`.
+    /// Sets `service.name` on the exported spans and names the tracer.
     pub service_name: &'static str,
-    /// Collector endpoint taken from the service's own config file or CLI
-    /// flags. The standard OTLP variables override this value.
+    /// Collector endpoint from the service's config file or CLI flags. The
+    /// standard OTLP variables override it.
     pub config_endpoint: Option<String>,
     /// Most verbose span level exported when [`SPAN_LEVEL_VAR`] is unset.
     pub default_span_level: LevelFilter,
+    /// Excludes the crates listed in [`TRANSPORT_CRATES`] from span export.
+    pub exclude_transport_crates: bool,
 }
 
 impl Config {
-    /// Creates a config that exports spans only when an OTLP variable supplies
-    /// an endpoint. Exports at `INFO`.
+    /// Exports spans at `INFO`, and only when an OTLP variable sets an endpoint.
     pub fn new(service_name: &'static str) -> Self {
         Self {
             service_name,
             config_endpoint: None,
             default_span_level: LevelFilter::INFO,
+            exclude_transport_crates: true,
         }
     }
 
@@ -115,22 +117,28 @@ impl Config {
         self
     }
 
-    /// Sets the span level used when [`SPAN_LEVEL_VAR`] is unset. Pass `DEBUG` or
-    /// `TRACE` to export more spans, for example behind a `--debug` flag.
+    /// Sets span verbosity when [`SPAN_LEVEL_VAR`] is unset.
     #[must_use]
     pub fn with_default_span_level(mut self, level: LevelFilter) -> Self {
         self.default_span_level = level;
+        self
+    }
+
+    /// Includes [`TRANSPORT_CRATES`], which can make export generate more spans.
+    /// Prefer `RUST_LOG` when debugging the transport.
+    #[must_use]
+    pub fn export_transport_crates(mut self) -> Self {
+        self.exclude_transport_crates = false;
         self
     }
 }
 
 /// The span-export layer to pass to `SubscriberExt::with`.
 ///
-/// `None` means no endpoint is configured. `tracing_subscriber` accepts `None`
-/// as a layer that does nothing, so the caller needs no branch.
+/// `None` disables export when the endpoint is unset or rejected.
 pub type SpanLayer<S> = Option<Box<dyn Layer<S> + Send + Sync>>;
 
-/// Holds the tracer provider for as long as the process runs.
+/// Keeps the tracer provider alive while the process runs.
 pub struct Tracing {
     provider: Option<SdkTracerProvider>,
     state: State,
@@ -150,14 +158,13 @@ enum State {
 }
 
 impl Tracing {
-    /// Logs how span export was configured. Call once, after initializing the
-    /// subscriber, otherwise the messages are discarded.
+    /// Logs export settings and errors. Call after initializing the subscriber.
     pub fn report(&self) {
         match &self.state {
             State::Off => {
                 tracing::debug!(
-                    traces_var = ENDPOINT_VARS[0],
-                    generic_var = ENDPOINT_VARS[1],
+                    traces_var = TRACES_ENDPOINT_VAR,
+                    generic_var = GENERIC_ENDPOINT_VAR,
                     "no OTLP endpoint configured; span export off"
                 );
             }
@@ -169,8 +176,6 @@ impl Tracing {
                 );
             }
             State::Failed { endpoint, error } => {
-                // The service does not need a working collector. A rejected
-                // endpoint logs a warning and the process keeps running.
                 tracing::warn!(
                     endpoint = %endpoint,
                     %error,
@@ -189,9 +194,8 @@ impl Tracing {
         }
     }
 
-    /// Sends the current batch of spans, then shuts the exporter down. Does
-    /// nothing when span export is off. Runs on `spawn_blocking` because
-    /// `SdkTracerProvider::shutdown` blocks for up to five seconds.
+    /// Flushes pending spans and stops the exporter; a no-op when export is off.
+    /// Runs on a blocking thread because shutdown can wait up to five seconds.
     pub async fn shutdown(self) {
         let Some(provider) = self.provider else {
             return;
@@ -211,12 +215,9 @@ impl Tracing {
 
 /// Builds the span-export layer and installs the W3C trace-context propagator.
 ///
-/// Call before initializing the subscriber, and [`Tracing::report`] after. Never
-/// fails: with no endpoint, or one the exporter rejects, the layer is `None` and
-/// `report` logs the reason.
-///
-/// The propagator is required for `traceparent` headers. OpenTelemetry's default
-/// does nothing, so without this every service starts its own trace.
+/// Requires a Tokio runtime. Call before initializing the subscriber, then call
+/// [`Tracing::report`] to log the result. An unset or rejected endpoint disables
+/// export. The propagator lets services share a trace through `traceparent`.
 pub fn setup<S>(config: Config) -> (SpanLayer<S>, Tracing)
 where
     S: tracing::Subscriber + for<'a> LookupSpan<'a> + Send + Sync,
@@ -241,13 +242,17 @@ where
         },
     };
 
+    let exclude_transport_crates = config.exclude_transport_crates;
     let layer = provider.as_ref().map(|provider| {
         let filter = tracing_subscriber::filter::filter_fn(move |metadata| {
-            exportable(span_level, metadata.level(), metadata.module_path())
+            exportable(
+                span_level,
+                exclude_transport_crates,
+                metadata.level(),
+                metadata.module_path(),
+            )
         })
-        // Reports the lowest level this layer accepts. Without the hint, a span
-        // filter set to `TRACE` enables every `trace!` call in the process and
-        // formats fields that no layer reads.
+        // Lets tracing skip levels that no layer accepts.
         .with_max_level_hint(span_level);
         let layer: Box<dyn Layer<S> + Send + Sync> = Box::new(
             tracing_opentelemetry::layer()
@@ -268,14 +273,9 @@ where
     )
 }
 
-/// Returns the collector endpoint to use, preferring the standard OTLP variables
-/// over the service's config value. `env` is a parameter so tests can set it.
-///
-/// Returning `None` disables span export. The exporter builder would otherwise
-/// default to `http://localhost:4317` and send spans nowhere (NVBUG 6717563).
+/// Prefers OTLP variables over config. Without either, disables export instead
+/// of using the SDK's localhost default.
 fn endpoint(env: impl Fn(&str) -> Option<String>, config_endpoint: Option<&str>) -> Option<String> {
-    // Treats an empty endpoint as unset, from a variable or from config. The
-    // exporter builder does the same.
     ENDPOINT_VARS
         .iter()
         .find_map(|var| env(var).filter(|endpoint| !endpoint.is_empty()))
@@ -286,9 +286,7 @@ fn endpoint(env: impl Fn(&str) -> Option<String>, config_endpoint: Option<&str>)
         })
 }
 
-/// Reads [`SPAN_LEVEL_VAR`] and returns the level to use, plus any value it could
-/// not parse. An unparseable value keeps the default level rather than disabling
-/// span export.
+/// Uses the default for an invalid level and returns the bad value for logging.
 fn span_level(
     env: impl Fn(&str) -> Option<String>,
     default: LevelFilter,
@@ -305,16 +303,14 @@ fn span_level(
 fn build_span_exporter(
     endpoint: &str,
 ) -> Result<opentelemetry_otlp::SpanExporter, opentelemetry_otlp::ExporterBuildError> {
-    // `with_tonic` selects OTLP over gRPC. The builder reads timeout, compression,
-    // TLS and headers from the standard `OTEL_EXPORTER_OTLP_*` variables.
+    // Use gRPC; let the SDK read timeout, compression, and header settings.
     opentelemetry_otlp::SpanExporter::builder()
         .with_tonic()
         .with_endpoint(endpoint)
         .build()
 }
 
-/// Calls no `with_sampler`, so the SDK default sampler applies and
-/// `OTEL_TRACES_SAMPLER` keeps working.
+/// Leaves sampling to the SDK so `OTEL_TRACES_SAMPLER` works.
 fn build_tracer_provider(
     exporter: opentelemetry_otlp::SpanExporter,
     service_name: &'static str,
@@ -329,11 +325,44 @@ fn build_tracer_provider(
         .build()
 }
 
-/// Decides whether the span layer exports a span or event, independently of the
-/// log layers. Rejects Tokio runtime spans at every level, because they do not
-/// always close and exporting them leaks memory.
-fn exportable(span_level: LevelFilter, level: &tracing::Level, module_path: Option<&str>) -> bool {
-    *level <= span_level && !module_path.is_some_and(|path| path.starts_with("tokio"))
+/// Exclude long-lived Tokio spans to avoid retaining their events in memory.
+const RUNTIME_CRATE: &str = "tokio";
+
+/// The exporter's gRPC stack. Excluded by default because exporting its spans
+/// can generate more spans to export.
+pub const TRANSPORT_CRATES: [&str; 4] = ["h2", "hyper", "tonic", "tower"];
+
+/// Filters exported spans and events independently of logs.
+fn exportable(
+    span_level: LevelFilter,
+    exclude_transport_crates: bool,
+    level: &tracing::Level,
+    module_path: Option<&str>,
+) -> bool {
+    if *level > span_level {
+        return false;
+    }
+
+    let Some(path) = module_path else {
+        return true;
+    };
+
+    if in_crate(path, RUNTIME_CRATE) {
+        return false;
+    }
+
+    !exclude_transport_crates
+        || !TRANSPORT_CRATES
+            .iter()
+            .any(|crate_name| in_crate(path, crate_name))
+}
+
+/// Matches a module path against a crate name, so `tower_of_hanoi` does not match
+/// `tower`.
+fn in_crate(module_path: &str, crate_name: &str) -> bool {
+    module_path
+        .strip_prefix(crate_name)
+        .is_some_and(|rest| rest.is_empty() || rest.starts_with("::"))
 }
 
 #[cfg(test)]
@@ -342,7 +371,6 @@ mod tests {
 
     use super::*;
 
-    /// The three endpoint sources [`endpoint`] chooses between.
     #[derive(Clone, Copy)]
     struct EndpointInputs {
         traces_var: Option<&'static str>,
@@ -367,8 +395,7 @@ mod tests {
 
     #[test]
     fn endpoint_prefers_standard_variables_over_config() {
-        // A different value per source, so a failing case names the source that
-        // took precedence.
+        // One value per source, so a failure names the source that won.
         const TRACES: &str = "http://traces-collector:4317";
         const GENERIC: &str = "http://generic-collector:4317";
         const CONFIG: &str = "http://config-collector:4317";
@@ -448,7 +475,7 @@ mod tests {
     }
 
     // The builder creates the gRPC channel on the current runtime, so this test
-    // needs a runtime even though it never connects to a collector.
+    // needs one even though it never connects to a collector.
     #[tokio::test]
     async fn span_exporter_build_validates_endpoint_eagerly() {
         value_scenarios!(
@@ -463,18 +490,22 @@ mod tests {
         );
     }
 
-    /// Only a `tracing` macro can construct `Metadata`. This test calls the
-    /// filter with the two fields it reads instead.
     #[test]
-    fn span_filter_gates_on_its_own_level_and_always_drops_tokio() {
+    fn span_filter_gates_on_its_own_level_and_always_drops_excluded_crates() {
         struct FilterInputs {
             span_level: LevelFilter,
+            exclude_transport_crates: bool,
             level: tracing::Level,
             module_path: &'static str,
         }
 
         fn allows(inputs: FilterInputs) -> bool {
-            exportable(inputs.span_level, &inputs.level, Some(inputs.module_path))
+            exportable(
+                inputs.span_level,
+                inputs.exclude_transport_crates,
+                &inputs.level,
+                Some(inputs.module_path),
+            )
         }
 
         const APP: &str = "carbide_pxe::routes::ipxe";
@@ -483,6 +514,7 @@ mod tests {
             run = allows;
             "a span at the configured level is exported" {
                 FilterInputs {
+                    exclude_transport_crates: true,
                     span_level: LevelFilter::INFO,
                     level: tracing::Level::INFO,
                     module_path: APP,
@@ -492,6 +524,7 @@ mod tests {
             "a span below the configured level is dropped, which keeps DEBUG spans out
              of a default deployment" {
                 FilterInputs {
+                    exclude_transport_crates: true,
                     span_level: LevelFilter::INFO,
                     level: tracing::Level::DEBUG,
                     module_path: APP,
@@ -500,22 +533,53 @@ mod tests {
 
             "raising the span level exports it, without the log filter being consulted" {
                 FilterInputs {
+                    exclude_transport_crates: true,
                     span_level: LevelFilter::TRACE,
                     level: tracing::Level::DEBUG,
                     module_path: APP,
                 } => true,
             }
 
-            "tokio spans are dropped even at TRACE, because exporting them leaks memory" {
+            "tokio spans are dropped even when the transport crates are exported" {
                 FilterInputs {
+                    exclude_transport_crates: false,
                     span_level: LevelFilter::TRACE,
                     level: tracing::Level::INFO,
                     module_path: "tokio::runtime::task",
                 } => false,
             }
 
+            "spans from the exporter's own gRPC stack are dropped, so exporting does not
+             create more spans to export" {
+                FilterInputs {
+                    exclude_transport_crates: true,
+                    span_level: LevelFilter::TRACE,
+                    level: tracing::Level::DEBUG,
+                    module_path: "h2::proto::streams::send",
+                } => false,
+            }
+
+            "opting in exports the gRPC stack, for debugging the transport itself" {
+                FilterInputs {
+                    exclude_transport_crates: false,
+                    span_level: LevelFilter::TRACE,
+                    level: tracing::Level::DEBUG,
+                    module_path: "h2::proto::streams::send",
+                } => true,
+            }
+
+            "a crate whose name only starts with an excluded name is still exported" {
+                FilterInputs {
+                    exclude_transport_crates: true,
+                    span_level: LevelFilter::TRACE,
+                    level: tracing::Level::INFO,
+                    module_path: "tower_of_hanoi::solver",
+                } => true,
+            }
+
             "OFF stops export while the exporter stays configured" {
                 FilterInputs {
+                    exclude_transport_crates: true,
                     span_level: LevelFilter::OFF,
                     level: tracing::Level::ERROR,
                     module_path: APP,

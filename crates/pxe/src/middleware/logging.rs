@@ -21,9 +21,7 @@ use axum::middleware::Next;
 use axum::response::Response;
 use tracing::Instrument;
 
-/// Opens an `info` span named `request` around the handler, recording the method,
-/// path, query, client address and headers of interest. The logfmt layer writes
-/// the span as one log line when it closes, and OTLP export uses the same span.
+/// Wraps the handler in a `request` span shared by logfmt and OTLP export.
 ///
 /// A `traceparent` header continues the caller's trace, otherwise the span starts
 /// a new one. `ForgeTlsClient` sends this span's context on outbound gRPC calls.
@@ -32,8 +30,7 @@ pub(crate) async fn logger(
     request: Request,
     next: Next,
 ) -> Response {
-    // Correlation id shared by the span line and every log emitted while serving
-    // the request, matching api-core's `LogService`.
+    // Links request logs using the same correlation ID format as api-core.
     let span_id = format!("{:#x}", u64::from_le_bytes(rand::random::<[u8; 8]>()));
     let span = tracing::info_span!(
         "request",
@@ -50,8 +47,7 @@ pub(crate) async fn logger(
         "response_headers_content-length" = tracing::field::Empty,
     );
 
-    // Sets the caller's trace context as this span's parent. Must run before the
-    // span is entered, because a started span cannot change parents.
+    // Set the parent before entering the span; started spans cannot change it.
     trace_propagation::set_span_parent_from_headers(&span, request.headers());
 
     // An absent header leaves its `Empty` placeholder unset, so logfmt omits it.
@@ -100,17 +96,12 @@ mod tests {
     use tracing_opentelemetry::OpenTelemetrySpanExt as _;
     use tracing_subscriber::layer::SubscriberExt as _;
 
-    /// The trace id a caller sends. An arbitrary value, distinctive enough that a
-    /// passing assertion cannot be a coincidence.
+    // Fixed IDs make an inherited trace easy to recognize.
     const INBOUND_TRACE: u128 = 0x42;
     const INBOUND_SPAN: u64 = 0x55;
 
-    /// Serves one request through the real middleware with an OpenTelemetry layer
-    /// installed. Returns the trace id the handler ran under, or `None` when the
-    /// span has no valid trace context.
-    ///
-    /// Reads the trace id inside the handler rather than from an exporter, because
-    /// that is the context an outbound call to nico-api would send.
+    /// Returns the handler's trace ID: the context an outbound call would use.
+    /// Returns `None` if the handler has no valid trace context.
     async fn served_trace_id(traceparent: Option<&str>) -> Option<TraceId> {
         opentelemetry::global::set_text_map_propagator(TraceContextPropagator::new());
 
@@ -141,8 +132,7 @@ mod tests {
             builder = builder.header("traceparent", traceparent);
         }
         let mut request = builder.body(Body::empty()).unwrap();
-        // The middleware extracts `ConnectInfo`, which `oneshot` does not set.
-        // In production `into_make_service_with_connect_info` sets it.
+        // Supply the peer address normally added by the HTTP server.
         request
             .extensions_mut()
             .insert(ConnectInfo::<std::net::SocketAddr>(
@@ -173,9 +163,7 @@ mod tests {
         );
     }
 
-    /// A booting node cannot send a `traceparent` header, so most requests arrive
-    /// without one and must still produce a trace. A malformed header behaves the
-    /// same way, and the request is still served.
+    // Missing or malformed trace context must still allow a fresh trace.
     #[tokio::test]
     async fn request_span_roots_a_fresh_trace_without_usable_inbound_context() {
         for traceparent in [None, Some("not-a-traceparent")] {

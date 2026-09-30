@@ -107,8 +107,7 @@ certificate:
   extraDnsNames: []
   extraUris: []
 
-## OTLP gRPC endpoint that PXE exports request traces to.
-## Empty by default disables span export
+## OTLP/gRPC collector endpoint. Empty leaves tracing off unless set through env.
 otlpEndpoint: ""
 
 env:

@@ -30,10 +30,9 @@ use tera::Tera;
 use tower_http::services::ServeDir;
 use tower_layer::Layer;
 use tracing::level_filters::LevelFilter;
-use tracing_subscriber::EnvFilter;
-use tracing_subscriber::Layer as _;
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
+use tracing_subscriber::{EnvFilter, Layer as _};
 
 mod common;
 mod config;
@@ -167,7 +166,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     )
     .await?;
 
-    // Requests have finished, so their spans are closed and can be sent.
+    // Flush completed spans after the connection drain finishes or times out.
     tracing.shutdown().await;
 
     Ok(())
@@ -203,8 +202,7 @@ fn setup_tracing() -> Result<carbide_instrument::otlp_tracing::Tracing, Box<dyn 
         .add_directive("rustls=warn".parse()?)
         .add_directive("tokio_util::codec=warn".parse()?);
 
-    // The span layer carries its own filter, so `log_filter` attaches to each log
-    // layer instead of the registry.
+    // Filter each log layer separately so RUST_LOG does not limit span export.
     let (span_layer, tracing) = carbide_instrument::otlp_tracing::setup(
         carbide_instrument::otlp_tracing::Config::new("nico-pxe"),
     );

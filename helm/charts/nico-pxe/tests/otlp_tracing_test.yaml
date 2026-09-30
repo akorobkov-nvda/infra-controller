@@ -30,8 +30,7 @@ tests:
             name: OTEL_EXPORTER_OTLP_TRACES_ENDPOINT
             value: http://opentelemetry-collector.otel.svc.cluster.local:4317
 
-  # The span level has no dedicated chart value. It is a debugging setting, and
-  # `env` is the supported way to set one.
+  # Set span verbosity through env.
   - it: allows the span level to be raised through env
     set:
       otlpEndpoint: http://collector:4317
