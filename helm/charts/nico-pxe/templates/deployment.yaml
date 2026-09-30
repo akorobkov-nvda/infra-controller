@@ -10,6 +10,9 @@
 {{- if $bootstrapRootCaEnabled -}}
 {{- $_ := set $env "FORGE_BOOTSTRAP_ROOT_CAFILE_PATH" "/var/run/secrets/bootstrap-root-ca/ca.crt" -}}
 {{- end -}}
+{{- with .Values.otlpEndpoint -}}
+{{- $_ := set $env "OTEL_EXPORTER_OTLP_TRACES_ENDPOINT" . -}}
+{{- end -}}
 apiVersion: apps/v1
 kind: Deployment
 metadata:

@@ -107,6 +107,10 @@ certificate:
   extraDnsNames: []
   extraUris: []
 
+## OTLP gRPC endpoint that PXE exports request traces to.
+## Empty by default disables span export
+otlpEndpoint: ""
+
 env:
   FORGE_ROOT_CAFILE_PATH: "/var/run/secrets/spiffe.io/ca.crt"
   NICO_ROOT_CAFILE_PATH: "/var/run/secrets/spiffe.io/ca.crt"

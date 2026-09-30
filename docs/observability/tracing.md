@@ -9,7 +9,8 @@ How NICo component tracing works, what it covers, how to turn it on and off and 
 - **nico-api** (the `carbide-api` binary) is NICo's primary tracing source and the subject of this
   document. **nico-dns** also emits traces, but with a separate simpler opt-in setup.
   **nico-bmc-proxy** emits traces for each proxied BMC request when configured (see
-  [nico-bmc-proxy tracing](#nico-bmc-proxy-tracing)).
+  [nico-bmc-proxy tracing](#nico-bmc-proxy-tracing)) and **nico-pxe** for each boot request it
+  serves (see [nico-pxe tracing](#nico-pxe-tracing)).
 - **nico-api traces are off by default**; two things must both be true before any spans are emitted:
   - An OTLP endpoint is configured at startup, either in the nico-api config TOML:
 
@@ -172,6 +173,43 @@ otlp_endpoint = "http://otel-collector.observability.svc.cluster.local:4317"
 Point this at the same collector nico-api uses: spans only join into one trace if every
 hop's exporter reaches the same backend. The components stay distinguishable by their
 `service.name`.
+
+### nico-pxe tracing
+
+`nico-pxe` traces each HTTP request it serves, including the iPXE script, cloud-init and TLS bootstrap
+routes. It uses the shared setup in `carbide_instrument::otlp_tracing`, enabled by that crate's
+`otlp-tracing` feature.
+
+- **Off by default.** `nico-pxe` exports spans only when an OTLP endpoint is configured. It has no
+  separate enabled flag and no runtime toggle.
+- **Endpoint.** `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT` (`otlpEndpoint` Helm value) or `OTEL_EXPORTER_OTLP_ENDPOINT`, which
+  also applies to metrics and logs. The `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT` var takes precedence when both are set.
+  If OTLP endpoint is not set or invalid `nico-pxe` logs a warning and disables span export.
+- **Span level, separate from the log level.** `NICO_TRACES_SPAN_LEVEL` sets the most verbose span
+  level exported, defaulting to `info`. A span's level is set by the macro that creates it, such as
+  `info_span!` or `#[instrument(level = "debug")]`, and decides only whether the exporter receives
+  the span. It accepts `off`, `error`, `warn`, `info`, `debug`, `trace`, or `0`-`5`. It is
+  independent of `RUST_LOG`: set it to `debug` or `trace` to export more spans without adding lines
+  to stdout, and changing `RUST_LOG` does not change which spans are exported. If the value is
+  invalid, `nico-pxe` logs a warning and keeps the default level.
+- **Inbound requests.** Each request opens a `request` span (`crates/pxe/src/middleware/logging.rs`)
+  and uses any inbound `traceparent` or `tracestate` header as its parent.
+  - A booting node cannot send those headers, so most requests span starts a new trace.
+  - A request from another traced service continues that service's trace.
+- **Outbound gRPC to nico-api.** Calls use the shared `ForgeTlsClient`, which wraps its transport
+  with `TraceInjectService` and sends the trace context on every request. No per-call code is
+  needed.
+- **Resource / tracer:** `service.name = nico-pxe`, tracer name `nico-pxe`.
+- **Span fields:** the same fields the request log line carries - `span_id`, client IP and port,
+  method, path, query, the Host, Content-Length and User-Agent headers when present and the
+  response status.
+- **Sampling.** The standard `OTEL_TRACES_SAMPLER` and `OTEL_TRACES_SAMPLER_ARG` variables are used to configure a sampler.
+  Prefer `parentbased_traceidratio` over `traceidratio`. A parent-based sampler applies the ratio only at
+  the service that starts a trace and later services reuse it.
+  The `nico-api` has a different tracing support approach. It does **not**
+  read these variables, because it installs `CarbideSpanSampler` instead.
+- **Shutdown.** On SIGTERM, `nico-pxe` stops accepting connections, lets in-flight requests finish, then
+  sends the last batch of spans.
 
 ### W3C trace-context propagation
 
