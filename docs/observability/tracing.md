@@ -53,8 +53,10 @@ The following binaries build an OTLP span exporter:
 - **nico-bmc-proxy** (`crates/bmc-proxy/src/setup.rs`) - one span per proxied BMC request, off by
   default behind endpoint plus `[tracing] enabled` (see
   [nico-bmc-proxy tracing](#nico-bmc-proxy-tracing)).
+- **nico-pxe** (`crates/pxe/src/main.rs`) - request spans, off by default unless an OTLP
+  endpoint is configured (see [nico-pxe tracing](#nico-pxe-tracing)).
 
-The other binaries (nico-pxe, nico-dhcp, nico-hardware-health, nico-ssh-console-rs, and
+The other binaries (nico-dhcp, nico-hardware-health, nico-ssh-console-rs, and
 nico-dsx-exchange-consumer) carry the OpenTelemetry crates in the workspace but do not build a span
 exporter, so they do not emit traces.
 
